@@ -1,0 +1,1452 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <title>Running 粿</title>
+    <script src="https://cdn.jsdelivr.net/npm/phaser@3.80.1/dist/phaser.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            touch-action: none;
+            -webkit-touch-callout: none;
+            -webkit-user-select: none;
+            user-select: none;
+            overscroll-behavior: none;
+        }
+        body {
+            background: #000;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            font-family: "Microsoft YaHei", sans-serif;
+        }
+        #phaser-game {
+            width: 100%;
+            height: 100%;
+            touch-action: none;
+        }
+        #phaser-game canvas {
+            touch-action: none;
+            display: block;
+        }
+    </style>
+</head>
+<body>
+<div id="phaser-game"></div>
+<script>
+/** 内部画布 1024×576（16:9，与 1707×960 同比例）；逻辑格网与此对齐，显示时 FIT 等比缩放+黑边 */
+const WIDTH = 1024;
+const HEIGHT = 576;
+const TILE = 32;
+
+/** 是否触屏设备（用于虚拟摇杆与 UI 紧凑布局） */
+function isTouchDevice() {
+    const hasTouch = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
+    if (!hasTouch) return false;
+    return window.matchMedia('(pointer: coarse)').matches || window.innerWidth <= 1024;
+}
+
+/** 移动端 / PC 左侧食材栏与摇杆布局（摇杆左下角，不遮挡食材清单） */
+function getUILayout() {
+    const touch = isTouchDevice();
+    return {
+        touch,
+        foodIconX: touch ? 16 : 24,
+        foodTextX: touch ? 34 : 44,
+        foodStartY: touch ? 22 : 36,
+        foodRowH: touch ? 28 : 36,
+        foodIconSize: touch ? 28 : 38,
+        foodFontSize: touch ? 12 : 16,
+        foodPanelW: touch ? 118 : 160,
+        joystick: touch ? { x: 88, y: HEIGHT - 88, radius: 52, thumbR: 22 } : null
+    };
+}
+
+/** 屏蔽移动端双击缩放等默认手势 */
+function bindTouchGuard() {
+    let lastTouchEnd = 0;
+    document.addEventListener('touchstart', (e) => {
+        if (e.touches.length > 1) e.preventDefault();
+    }, { passive: false });
+    document.addEventListener('touchend', (e) => {
+        const now = Date.now();
+        if (now - lastTouchEnd <= 300) e.preventDefault();
+        lastTouchEnd = now;
+    }, { passive: false });
+    document.addEventListener('gesturestart', (e) => e.preventDefault());
+}
+bindTouchGuard();
+
+const FOOD_LIST = [
+    'celery', 'mushroom', 'peanut', 'sugar',
+    'glutinousRice', 'water', 'boboGrass'
+];
+
+const FOOD_CN = [
+    '芹菜', '香菇', '花生', '糖', '面粉', '水', '鼠壳草'
+];
+
+/** 地图上个别食材显示尺寸（默认 52） */
+const FOOD_MAP_SIZES = { celery: 64, boboGrass: 64 };
+
+/** 须在 1 分 30 秒内集齐全部 7 样食材 */
+const GAME_TIME_LIMIT = 90;
+const SPOON_DISPLAY_SIZE = 26;
+const SPOON_QUIZ_QUESTION = '红桃粿是否只能做甜口馅料？';
+const SPOON_QUIZ_ANSWER = '否';
+
+const CROP_KEYS = ['block_bottle', 'block_soap', 'block_cabinet', 'spoon', ...FOOD_LIST];
+const TRANSPARENT_KEYS = ['player_front', 'player_back', ...CROP_KEYS];
+
+/** Phaser 自带物理调试：URL 加 ?debug 开启 */
+const PHASER_PHYSICS_DEBUG = new URLSearchParams(location.search).has('debug');
+/** 坐标标注：URL 加 ?coords 显示全图网格坐标 */
+const SHOW_COORDS = new URLSearchParams(location.search).has('coords');
+/** 路线色块 overlay：URL 加 ?paths 开启；正常游玩不绘制，仅显示 kitchen_bg */
+const SHOW_PATH_OVERLAY = new URLSearchParams(location.search).has('paths');
+
+const PATH_COLORS = { 0: 0x3498db, 1: 0xe67e22, 2: 0xe74c3c };
+const POOL_COLOR = 0x27ae60;
+const PATH_LABELS = { 0: '地面', 1: '桌面', 2: '顶桌' };
+
+const GRID_COLS = WIDTH / TILE;
+const GRID_ROWS = HEIGHT / TILE;
+
+function gridToPixel(gx, gy) {
+    return { x: gx * TILE + TILE / 2, y: gy * TILE + TILE / 2 };
+}
+
+/** 路线 overlay 与背景 32px 格对齐（不加角色脚点偏移） */
+function gridToTileCenter(gx, gy) {
+    return { x: gx * TILE + TILE / 2, y: gy * TILE + TILE / 2 };
+}
+
+function rectCells(x1, y1, x2, y2) {
+    const arr = [];
+    for (let y = y1; y <= y2; y++)
+        for (let x = x1; x <= x2; x++) arr.push([x, y]);
+    return arr;
+}
+
+function cellKey(gx, gy, elev) {
+    return `${gx},${gy},${elev}`;
+}
+
+function stairCoords(list) {
+    const s = new Set();
+    list.forEach(([x, y, e]) => s.add(cellKey(x, y, e)));
+    return s;
+}
+
+function coords(list) {
+    const s = new Set();
+    list.forEach(([x, y]) => s.add(`${x},${y}`));
+    return s;
+}
+
+/** 水池（elev2 绿色 overlay；无锅铲踏入失败，有锅铲可通行） */
+const WATER_CELLS = coords(rectCells(13, 0, 24, 2));
+
+/** 顶桌红色可走区：row0-4 整行，排除水池 */
+function topTableWalkCells() {
+    const arr = [];
+    for (let gy = 0; gy <= 4; gy++) {
+        for (let gx = 0; gx < GRID_COLS; gx++) {
+            if (!WATER_CELLS.has(`${gx},${gy}`)) arr.push([gx, gy]);
+        }
+    }
+    return arr;
+}
+
+/** 右上梯：顶部 6 格橙色（row3-5）与下方蓝格断开；梯脚仅 elev0 蓝色 */
+const RIGHT_STAIR_ORANGE_TOP = rectCells(24, 3, 25, 5);
+const RIGHT_STAIR_BLUE_FOOT = rectCells(24, 6, 25, 6);
+const RIGHT_STAIR_TOP_ROW = 3;
+const RIGHT_STAIR_BOTTOM_ROW = 6;
+
+/** 竖向楼梯/砧板（橙色 overlay；右上梯仅顶部 6 格，不与下方相连） */
+const VERTICAL_STAIR_CELLS = coords([
+    ...rectCells(17, 11, 21, 15),
+    ...rectCells(9, 12, 10, 14),
+    ...RIGHT_STAIR_ORANGE_TOP
+]);
+
+/**
+ * 平台层级（与 kitchen_bg / 参考图 1024×576 对齐，每格 32px）：
+ * elev0 蓝=蓝色地砖   elev1 橙=褐桌+竖楼梯+砧板   elev2 红=顶桌 row0-4
+ */
+const LEVEL = {
+    walk: {
+        1: coords([
+            ...rectCells(8, 7, 31, 11),
+            ...rectCells(17, 11, 21, 15),
+            ...rectCells(9, 12, 10, 14),
+            ...RIGHT_STAIR_ORANGE_TOP,
+            ...rectCells(0, 15, 27, 17)
+        ]),
+        0: coords([
+            ...rectCells(0, 5, 31, 6),
+            ...rectCells(0, 7, 7, 14),
+            ...rectCells(8, 12, 8, 14),
+            ...rectCells(9, 12, 10, 14),
+            ...rectCells(0, 14, 16, 14),
+            ...rectCells(22, 14, 31, 14),
+            ...RIGHT_STAIR_BLUE_FOOT,
+            ...rectCells(28, 15, 31, 17)
+        ]),
+        2: coords(topTableWalkCells())
+    },
+    obstacles: [
+        { gx: 18, gy: 12, elev: 1, sprite: null, w: 32, h: 32, kind: 'board' },
+        { gx: 18, gy: 13, elev: 1, sprite: null, w: 32, h: 32, kind: 'board' },
+        { gx: 9, gy: 8, elev: 1, sprite: 'block_bottle', w: 106, h: 96, kind: 'bottle' },
+        { gx: 25, gy: 8, elev: 1, sprite: 'block_soap', w: 62, h: 50, kind: 'soap' }
+    ],
+    water: WATER_CELLS,
+    stairCells: stairCoords([
+        [9, 11, 1], [10, 11, 1],
+        [9, 12, 0], [10, 12, 0], [9, 13, 0], [10, 13, 0],
+        [24, RIGHT_STAIR_TOP_ROW, 2], [25, RIGHT_STAIR_TOP_ROW, 2],
+        [24, RIGHT_STAIR_BOTTOM_ROW, 0], [25, RIGHT_STAIR_BOTTOM_ROW, 0]
+    ]),
+    ladders: [
+        { from: { gx: 9, gy: 11, elev: 1 }, to: { gx: 9, gy: 12, elev: 0 }, dir: 'down' },
+        { from: { gx: 10, gy: 11, elev: 1 }, to: { gx: 10, gy: 12, elev: 0 }, dir: 'down' },
+        { from: { gx: 9, gy: 12, elev: 0 }, to: { gx: 9, gy: 11, elev: 1 }, dir: 'up' },
+        { from: { gx: 10, gy: 12, elev: 0 }, to: { gx: 10, gy: 11, elev: 1 }, dir: 'up' },
+        { from: { gx: 24, gy: RIGHT_STAIR_TOP_ROW, elev: 2 }, to: { gx: 24, gy: RIGHT_STAIR_BOTTOM_ROW, elev: 0 }, dir: 'down' },
+        { from: { gx: 25, gy: RIGHT_STAIR_TOP_ROW, elev: 2 }, to: { gx: 25, gy: RIGHT_STAIR_BOTTOM_ROW, elev: 0 }, dir: 'down' },
+        { from: { gx: 24, gy: RIGHT_STAIR_BOTTOM_ROW, elev: 0 }, to: { gx: 24, gy: RIGHT_STAIR_TOP_ROW, elev: 2 }, dir: 'up' },
+        { from: { gx: 25, gy: RIGHT_STAIR_BOTTOM_ROW, elev: 0 }, to: { gx: 25, gy: RIGHT_STAIR_TOP_ROW, elev: 2 }, dir: 'up' }
+    ],
+    playerStart: { gx: 2, gy: 16, elev: 1 },
+    flag: { gx: 5, gy: 0, elev: 2 },
+    /** 水池下方地面（elev0） */
+    spoon: { gx: 18, gy: 6, elev: 0 },
+    foods: [
+        { key: 'celery', gx: 8, gy: 15, elev: 1 },
+        { key: 'sugar', gx: 12, gy: 16, elev: 1 },
+        { key: 'mushroom', gx: 14, gy: 15, elev: 1 },
+        { key: 'glutinousRice', gx: 26, gy: 9, elev: 1 },
+        { key: 'boboGrass', gx: 23, gy: 8, elev: 1 },
+        { key: 'peanut', gx: 20, gy: 8, elev: 1 },
+        { key: 'water', gx: 7, gy: 13, elev: 0 }
+    ]
+};
+
+/** 除「水」外须全部集齐才开放中桌左侧楼梯（桌面↔地面） */
+const FOOD_UNLOCK_STAIRS = FOOD_LIST.filter(k => k !== 'water');
+
+function hasUnlockedDeskStairs(collectedSet) {
+    return FOOD_UNLOCK_STAIRS.every(k => collectedSet.has(k));
+}
+
+/** 中桌左侧竖楼梯（elev1 col9-10 row11 ↔ elev0 col9-10 row12+） */
+function isDeskToGroundLadder(lad) {
+    const f = lad.from;
+    const t = lad.to;
+    return (f.elev === 1 && t.elev === 0 && f.gy === 11 && f.gx >= 9 && f.gx <= 10 &&
+        t.gx >= 9 && t.gx <= 10 && t.gy >= 12) ||
+        (f.elev === 0 && t.elev === 1 && t.gy === 11 && t.gx >= 9 && t.gx <= 10 &&
+        f.gx >= 9 && f.gx <= 10 && f.gy >= 12);
+}
+
+function tryDeskStairDown(gx, gy, elev, dir, collectedSet) {
+    if (dir !== 'down' || elev !== 1 || !hasUnlockedDeskStairs(collectedSet)) return null;
+    if (gx < 9 || gx > 10 || gy !== 11) return null;
+    for (const lad of LEVEL.ladders) {
+        const f = lad.from;
+        if (f.gx === gx && f.gy === gy && f.elev === 1 && lad.dir === 'down' &&
+            isDeskToGroundLadder(lad)) {
+            const t = lad.to;
+            if (isWalkable(t.gx, t.gy, t.elev) && !isObstacle(t.gx, t.gy, t.elev)) return t;
+        }
+    }
+    return null;
+}
+
+function isWalkable(gx, gy, elev) {
+    return LEVEL.walk[elev] && LEVEL.walk[elev].has(`${gx},${gy}`);
+}
+
+function isObstacle(gx, gy, elev) {
+    return LEVEL.obstacles.some(o =>
+        o.gx === gx && o.gy === gy && o.elev === elev &&
+        o.kind !== 'bottle' && o.kind !== 'soap');
+}
+
+function isStairCell(gx, gy, elev) {
+    return LEVEL.stairCells.has(cellKey(gx, gy, elev));
+}
+
+function isPoolCell(gx, gy, elev) {
+    return elev === 2 && LEVEL.water.has(`${gx},${gy}`);
+}
+
+function tryLadderMove(gx, gy, elev, dir, collectedSet) {
+    if (!isStairCell(gx, gy, elev)) return null;
+    for (const lad of LEVEL.ladders) {
+        const f = lad.from;
+        if (f.gx === gx && f.gy === gy && f.elev === elev && lad.dir === dir) {
+            if (isDeskToGroundLadder(lad) && !hasUnlockedDeskStairs(collectedSet)) return null;
+            const t = lad.to;
+            if (isWalkable(t.gx, t.gy, t.elev) && !isObstacle(t.gx, t.gy, t.elev)) return t;
+        }
+    }
+    return null;
+}
+
+function isLadderTransition(fromGx, fromGy, fromElev, toGx, toGy, toElev) {
+    return LEVEL.ladders.some(lad => {
+        const f = lad.from;
+        const t = lad.to;
+        return f.gx === fromGx && f.gy === fromGy && f.elev === fromElev &&
+            t.gx === toGx && t.gy === toGy && t.elev === toElev;
+    }) || LEVEL.ladders.some(lad => {
+        const f = lad.from;
+        const t = lad.to;
+        return t.gx === fromGx && t.gy === fromGy && t.elev === fromElev &&
+            f.gx === toGx && f.gy === toGy && f.elev === toElev;
+    });
+}
+
+/** 进入 elev0 白色地面必须经由 ladders 定义的楼梯 */
+function canEnterGround(fromGx, fromGy, fromElev, toGx, toGy, toElev, collectedSet) {
+    if (toElev !== 0 || fromElev === 0) return true;
+    if (!isLadderTransition(fromGx, fromGy, fromElev, toGx, toGy, toElev)) return false;
+    const lad = LEVEL.ladders.find(l => {
+        const f = l.from, t = l.to;
+        return f.gx === fromGx && f.gy === fromGy && f.elev === fromElev &&
+            t.gx === toGx && t.gy === toGy && t.elev === toElev;
+    });
+    if (lad && isDeskToGroundLadder(lad) && !hasUnlockedDeskStairs(collectedSet)) return false;
+    return true;
+}
+
+/**
+ * 移动解析：同层邻格行走；跨层仅楼梯格+方向匹配；砧板阻挡；调料瓶/肥皂可走入并触发效果。
+ */
+function resolveMove(fromGx, fromGy, fromElev, dir, collectedSet) {
+    const delta = { up: [0, -1], down: [0, 1], left: [-1, 0], right: [1, 0] };
+    const [dx, dy] = delta[dir];
+    const nx = fromGx + dx;
+    const ny = fromGy + dy;
+
+    const deskDown = tryDeskStairDown(fromGx, fromGy, fromElev, dir, collectedSet);
+    if (deskDown) return deskDown;
+
+    if (isStairCell(fromGx, fromGy, fromElev)) {
+        const stairDest = tryLadderMove(fromGx, fromGy, fromElev, dir, collectedSet);
+        if (stairDest) return stairDest;
+    }
+
+    if (isWalkable(nx, ny, fromElev) && !isObstacle(nx, ny, fromElev)) {
+        return { gx: nx, gy: ny, elev: fromElev };
+    }
+
+    if (fromElev === 2 && isPoolCell(nx, ny, 2)) {
+        return { gx: nx, gy: ny, elev: 2 };
+    }
+
+    return null;
+}
+
+/** 桌沿隐形墙：同层目标格不可走且非楼梯合法跨层时，禁止移动 */
+function needsDesktopEdgeBlock(fgx, fgy, felev, nx, ny) {
+    if (isWalkable(nx, ny, felev) && !isObstacle(nx, ny, felev)) return false;
+    if (isStairCell(fgx, fgy, felev)) {
+        const dir = nx > fgx ? 'right' : nx < fgx ? 'left' : ny > fgy ? 'down' : 'up';
+        if (tryLadderMove(fgx, fgy, felev, dir, new Set())) return false;
+    }
+    return !isWalkable(nx, ny, felev);
+}
+
+function makeTextureTransparent(scene, key, threshold = 30) {
+    if (!scene.textures.exists(key)) return;
+    const src = scene.textures.get(key).getSourceImage();
+    const canvas = document.createElement('canvas');
+    canvas.width = src.width;
+    canvas.height = src.height;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(src, 0, 0);
+    const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const d = imgData.data;
+    for (let i = 0; i < d.length; i += 4) {
+        if (d[i] <= threshold && d[i + 1] <= threshold && d[i + 2] <= threshold) {
+            d[i + 3] = 0;
+        }
+    }
+    ctx.putImageData(imgData, 0, 0);
+    scene.textures.remove(key);
+    scene.textures.addCanvas(key, canvas);
+}
+
+function makePlayerTransparent(scene, key) {
+    if (!scene.textures.exists(key)) return;
+    const src = scene.textures.get(key).getSourceImage();
+    const canvas = document.createElement('canvas');
+    canvas.width = src.width;
+    canvas.height = src.height;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(src, 0, 0);
+    const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const d = imgData.data;
+    for (let i = 0; i < d.length; i += 4) {
+        const r = d[i], g = d[i + 1], b = d[i + 2];
+        if ((r <= 30 && g <= 30 && b <= 30) || (r >= 238 && g >= 238 && b >= 238)) {
+            d[i + 3] = 0;
+        }
+    }
+    ctx.putImageData(imgData, 0, 0);
+    scene.textures.remove(key);
+    scene.textures.addCanvas(key, canvas);
+}
+
+function cropIconTexture(scene, key) {
+    if (!scene.textures.exists(key)) return;
+    const src = scene.textures.get(key).getSourceImage();
+    if (src.width <= 320 && src.height <= 320) return;
+    const canvas = document.createElement('canvas');
+    canvas.width = src.width;
+    canvas.height = src.height;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(src, 0, 0);
+    const d = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+    const scanH = Math.floor(canvas.height * 0.62);
+    let minX = canvas.width, minY = scanH, maxX = 0, maxY = 0;
+    for (let y = 0; y < scanH; y++) {
+        for (let x = 0; x < canvas.width; x++) {
+            const i = (y * canvas.width + x) * 4;
+            if (d[i] > 30 || d[i + 1] > 30 || d[i + 2] > 30) {
+                minX = Math.min(minX, x); minY = Math.min(minY, y);
+                maxX = Math.max(maxX, x); maxY = Math.max(maxY, y);
+            }
+        }
+    }
+    if (maxX < minX) return;
+    const pad = 4;
+    minX = Math.max(0, minX - pad);
+    minY = Math.max(0, minY - pad);
+    const w = Math.min(canvas.width - minX, maxX - minX + 1 + pad * 2);
+    const h = Math.min(scanH - minY, maxY - minY + 1 + pad * 2);
+    const cropped = document.createElement('canvas');
+    cropped.width = w; cropped.height = h;
+    cropped.getContext('2d').drawImage(canvas, minX, minY, w, h, 0, 0, w, h);
+    scene.textures.remove(key);
+    scene.textures.addCanvas(key, cropped);
+}
+
+function addKitchenBg(scene, alpha = 1) {
+    return scene.add.image(WIDTH / 2, HEIGHT / 2, 'kitchen_bg')
+        .setDisplaySize(WIDTH, HEIGHT).setAlpha(alpha);
+}
+
+/** 绘制各层可行走路线（?paths 或坐标标注场景下可见；正常游玩不遮挡背景） */
+function drawWalkablePaths(scene, activeElev, depth = 2) {
+    const layer = scene.add.container(0, 0).setDepth(depth);
+    const showColors = SHOW_PATH_OVERLAY || scene.scene.key === 'CoordsScene';
+    if (!showColors) return layer;
+
+    const outline = scene.add.graphics();
+
+    [0, 1, 2].forEach(elev => {
+        const walkSet = LEVEL.walk[elev];
+        if (!walkSet) return;
+        const alpha = elev === activeElev ? 0.45 : 0.18;
+        walkSet.forEach(key => {
+            const [gx, gy] = key.split(',').map(Number);
+            const p = gridToTileCenter(gx, gy);
+            layer.add(scene.add.rectangle(
+                p.x, p.y, TILE, TILE, PATH_COLORS[elev], alpha
+            ));
+        });
+    });
+
+    const poolAlpha = activeElev === 2 ? 0.55 : 0.28;
+    LEVEL.water.forEach(key => {
+        const [gx, gy] = key.split(',').map(Number);
+        const p = gridToTileCenter(gx, gy);
+        layer.add(scene.add.rectangle(
+            p.x, p.y, TILE, TILE, POOL_COLOR, poolAlpha
+        ));
+    });
+
+    const stairOrangeAlpha = activeElev === 1 ? 0.52 : 0.34;
+    VERTICAL_STAIR_CELLS.forEach(key => {
+        const [gx, gy] = key.split(',').map(Number);
+        const p = gridToTileCenter(gx, gy);
+        layer.add(scene.add.rectangle(
+            p.x, p.y, TILE, TILE, PATH_COLORS[1], stairOrangeAlpha
+        ));
+    });
+
+    outline.lineStyle(2, 0xa3e635, 0.95);
+    LEVEL.stairCells.forEach(key => {
+        const parts = key.split(',');
+        const gx = Number(parts[0]);
+        const gy = Number(parts[1]);
+        outline.strokeRect(gx * TILE + 1, gy * TILE + 1, TILE - 2, TILE - 2);
+    });
+    layer.add(outline);
+
+    const legend = scene.add.text(WIDTH - 10, 8, [
+        '可行走路线',
+        `高亮：${PATH_LABELS[activeElev]} elev${activeElev}`,
+        '蓝=地面  橙=桌面  红=顶桌',
+        '绿块=水池(无锅铲失败)  浅绿框=楼梯'
+    ].join('\n'), {
+        fontSize: '11px', fill: '#ffffff', backgroundColor: '#000000cc',
+        padding: { x: 6, y: 4 }, align: 'right', lineSpacing: 2
+    }).setOrigin(1, 0);
+    layer.add(legend);
+
+    return layer;
+}
+
+/** 在背景上绘制全部网格线与坐标点（gx,gy） */
+function drawAllGridCoords(scene, depth = 50) {
+    const g = scene.add.graphics().setDepth(depth);
+    g.lineStyle(1, 0xffffff, 0.35);
+    for (let gx = 0; gx <= GRID_COLS; gx++) {
+        g.lineBetween(gx * TILE, 0, gx * TILE, HEIGHT);
+    }
+    for (let gy = 0; gy <= GRID_ROWS; gy++) {
+        g.lineBetween(0, gy * TILE, WIDTH, gy * TILE);
+    }
+
+    for (let gy = 0; gy < GRID_ROWS; gy++) {
+        for (let gx = 0; gx < GRID_COLS; gx++) {
+            scene.add.text(gx * TILE + 1, gy * TILE + 1, `${gx},${gy}`, {
+                fontFamily: 'Consolas, monospace',
+                fontSize: '8px',
+                fill: '#ffeb3b',
+                backgroundColor: '#000000aa',
+                padding: { x: 1, y: 0 }
+            }).setDepth(depth + 1);
+        }
+    }
+}
+
+/** 标注关卡关键点位（带名称与 elev） */
+function drawLevelMarkers(scene, depth = 60) {
+    const addMark = (gx, gy, label, color) => {
+        const p = gridToPixel(gx, gy);
+        scene.add.circle(p.x, p.y, 6, color, 0.85).setDepth(depth);
+        scene.add.text(p.x, p.y - 14, label, {
+            fontFamily: 'Microsoft YaHei, sans-serif',
+            fontSize: '11px',
+            fill: '#ffffff',
+            backgroundColor: color,
+            padding: { x: 3, y: 1 }
+        }).setOrigin(0.5).setDepth(depth + 1);
+    };
+
+    addMark(LEVEL.playerStart.gx, LEVEL.playerStart.gy,
+        `出生 elev${LEVEL.playerStart.elev}`, 0xe74c3c);
+
+    LEVEL.foods.forEach(f => {
+        addMark(f.gx, f.gy, `${f.key} elev${f.elev}`, 0x2ecc71);
+    });
+
+    addMark(LEVEL.spoon.gx, LEVEL.spoon.gy, `spoon elev${LEVEL.spoon.elev}`, 0xf39c12);
+    addMark(LEVEL.flag.gx, LEVEL.flag.gy, `旗帜 elev${LEVEL.flag.elev}`, 0x9b59b6);
+
+    LEVEL.obstacles.forEach(o => {
+        if (o.sprite) addMark(o.gx, o.gy, `${o.kind} elev${o.elev}`, 0x95a5a6);
+    });
+
+    LEVEL.stairCells.forEach(key => {
+        const [gx, gy, elev] = key.split(',').map(Number);
+        addMark(gx, gy, `楼梯 elev${elev}`, 0x3498db);
+    });
+
+    LEVEL.water.forEach(key => {
+        const [gx, gy] = key.split(',').map(Number);
+        addMark(gx, gy, '水池 elev2', 0x1abc9c);
+    });
+}
+
+class BootScene extends Phaser.Scene {
+    constructor() { super('BootScene'); }
+
+    preload() {
+        this.load.image('kitchen_bg', './assets/kitchen_bg.png');
+        this.load.image('player_front', './assets/redkue_front.png');
+        this.load.image('player_back', './assets/redkue_back.png');
+        this.load.image('block_bottle', './assets/bottle.png');
+        this.load.image('block_soap', './assets/soap.png');
+        this.load.image('block_cabinet', './assets/cabinet.png');
+        this.load.image('spoon', './assets/spoon.png');
+        FOOD_LIST.forEach(key => {
+            const file = key === 'glutinousRice' ? 'rice' : key === 'boboGrass' ? 'grass' : key;
+            this.load.image(key, `./assets/${file}.png`);
+        });
+    }
+
+    create() {
+        const g = this.make.graphics({ add: false });
+        g.fillStyle(0x5d3a1a);
+        g.fillRect(4, 6, 4, 26);
+        g.fillStyle(0xe74c3c);
+        g.fillRect(8, 6, 20, 14);
+        g.fillStyle(0xff6b6b);
+        g.fillRect(8, 6, 20, 4);
+        g.fillStyle(0xc0392b);
+        g.fillRect(8, 16, 20, 4);
+        g.generateTexture('flag', 32, 32);
+        g.destroy();
+
+        const wg = this.make.graphics({ add: false });
+        wg.fillStyle(0xffffff, 0.01);
+        wg.fillRect(0, 0, TILE, TILE);
+        wg.generateTexture('wall_hitbox', TILE, TILE);
+        wg.destroy();
+
+        if (!this.textures.exists('block_cabinet')) {
+            const cg = this.make.graphics({ add: false });
+            cg.fillStyle(0x6d4c2a);
+            cg.fillRect(4, 8, 56, 64);
+            cg.fillStyle(0x8b6914);
+            cg.fillRect(8, 12, 24, 56);
+            cg.fillStyle(0x4a3520);
+            cg.fillRect(36, 12, 20, 56);
+            cg.lineStyle(2, 0xd4a574);
+            cg.strokeRect(36, 12, 20, 56);
+            cg.generateTexture('block_cabinet', 64, 80);
+            cg.destroy();
+        }
+
+        CROP_KEYS.filter(k => k !== 'block_cabinet').forEach(key => cropIconTexture(this, key));
+        makePlayerTransparent(this, 'player_front');
+        makePlayerTransparent(this, 'player_back');
+        TRANSPARENT_KEYS.filter(k => k !== 'block_cabinet').forEach(key => makeTextureTransparent(this, key));
+
+        ['player_front', 'player_back', ...CROP_KEYS, 'flag'].forEach(key => {
+            if (this.textures.exists(key))
+                this.textures.get(key).setFilter(Phaser.Textures.FilterMode.NEAREST);
+        });
+
+        this.scene.start(SHOW_COORDS ? 'CoordsScene' : 'MenuScene');
+    }
+}
+
+/** 坐标标注专用场景：index.html?coords 进入 */
+class CoordsScene extends Phaser.Scene {
+    constructor() { super('CoordsScene'); }
+
+    create() {
+        addKitchenBg(this);
+        drawAllGridCoords(this);
+        drawWalkablePaths(this, 1, 45);
+        drawLevelMarkers(this);
+
+        this.add.text(WIDTH / 2, 14, 'Running 粿 · 全图坐标标注（32×18 格，每格 32px）', {
+            fontSize: '16px', fill: '#fff', backgroundColor: '#000000cc',
+            padding: { x: 8, y: 4 }
+        }).setOrigin(0.5).setDepth(70);
+
+        const legend = [
+            '图例：淡色底=可行走区（橙elev1 蓝elev0 红elev2）',
+            '红=出生  绿=食材  蓝=楼梯  紫=旗帜  青=水池  灰=障碍',
+            '点击返回菜单'
+        ].join('\n');
+        this.add.text(10, HEIGHT - 58, legend, {
+            fontSize: '12px', fill: '#ecf0f1', backgroundColor: '#000000bb',
+            padding: { x: 6, y: 4 }
+        }).setDepth(70).setInteractive({ useHandCursor: true })
+            .on('pointerdown', () => this.scene.start('MenuScene'));
+    }
+}
+
+/**
+ * 左下角虚拟摇杆：半透明像素风，离散四方向，与键盘共用 tryMove
+ * 仅在触屏设备 GameScene 中创建；触摸起点需在摇杆区域内
+ */
+class VirtualJoystick {
+    constructor(scene, layout) {
+        this.scene = scene;
+        this.cfg = layout.joystick;
+        this.baseX = this.cfg.x;
+        this.baseY = this.cfg.y;
+        this.radius = this.cfg.radius;
+        this.thumbR = this.cfg.thumbR;
+        this.active = false;
+        this.pointerId = null;
+        this.dirLocked = false;
+        this.currentDir = null;
+
+        this.container = scene.add.container(this.baseX, this.baseY).setDepth(200).setScrollFactor(0);
+        const g = scene.add.graphics();
+        g.fillStyle(0x000000, 0.28);
+        g.lineStyle(2, 0xffffff, 0.32);
+        g.fillCircle(0, 0, this.radius);
+        g.strokeCircle(0, 0, this.radius);
+        g.lineStyle(1, 0xffffff, 0.22);
+        g.lineBetween(-this.radius + 8, 0, this.radius - 8, 0);
+        g.lineBetween(0, -this.radius + 8, 0, this.radius - 8);
+        this.thumb = scene.add.circle(0, 0, this.thumbR, 0xffffff, 0.42);
+        this.thumb.setStrokeStyle(2, 0xcccccc, 0.45);
+        this.container.add([g, this.thumb]);
+
+        this._onDown = (p) => this.onPointerDown(p);
+        this._onMove = (p) => this.onPointerMove(p);
+        this._onUp = (p) => this.onPointerUp(p);
+        scene.input.on('pointerdown', this._onDown);
+        scene.input.on('pointermove', this._onMove);
+        scene.input.on('pointerup', this._onUp);
+        scene.input.on('pointerupoutside', this._onUp);
+    }
+
+    inHitArea(px, py) {
+        return Phaser.Math.Distance.Between(px, py, this.baseX, this.baseY) <= this.radius * 1.65;
+    }
+
+    onPointerDown(pointer) {
+        if (!this.scene.canMove || pointer.isDown === false) return;
+        if (this.scene.quizActive) return;
+        if (!this.inHitArea(pointer.x, pointer.y)) return;
+        this.active = true;
+        this.pointerId = pointer.id;
+        this.updateFromPointer(pointer);
+    }
+
+    onPointerMove(pointer) {
+        if (!this.active || pointer.id !== this.pointerId) return;
+        this.updateFromPointer(pointer);
+    }
+
+    onPointerUp(pointer) {
+        if (!this.active || pointer.id !== this.pointerId) return;
+        this.resetThumb();
+    }
+
+    updateFromPointer(pointer) {
+        let dx = pointer.x - this.baseX;
+        let dy = pointer.y - this.baseY;
+        const len = Math.hypot(dx, dy);
+        const maxDist = this.radius - this.thumbR - 4;
+        if (len > maxDist) {
+            dx = (dx / len) * maxDist;
+            dy = (dy / len) * maxDist;
+        }
+        this.thumb.setPosition(dx, dy);
+
+        const dir = this.calcDir(dx, dy);
+        this.currentDir = dir;
+        if (dir && !this.dirLocked && this.canUseMove()) {
+            this.scene.tryMove(dir);
+            this.dirLocked = true;
+        }
+        if (!dir) this.dirLocked = false;
+    }
+
+    canUseMove() {
+        const s = this.scene;
+        return s.canMove && s.canInput && !s.isMoving && !s.gameOver &&
+            !s.bottleFrozen && !s.quizActive;
+    }
+
+    calcDir(dx, dy) {
+        const len = Math.hypot(dx, dy);
+        if (len < this.radius * 0.28) return null;
+        if (Math.abs(dx) > Math.abs(dy)) return dx > 0 ? 'right' : 'left';
+        return dy > 0 ? 'down' : 'up';
+    }
+
+    resetThumb() {
+        this.active = false;
+        this.pointerId = null;
+        this.dirLocked = false;
+        this.currentDir = null;
+        this.thumb.setPosition(0, 0);
+    }
+
+    destroy() {
+        const s = this.scene;
+        if (!s || !s.input) return;
+        s.input.off('pointerdown', this._onDown);
+        s.input.off('pointermove', this._onMove);
+        s.input.off('pointerup', this._onUp);
+        s.input.off('pointerupoutside', this._onUp);
+        if (this.container) this.container.destroy(true);
+        this.container = null;
+    }
+}
+
+class MenuScene extends Phaser.Scene {
+    constructor() { super('MenuScene'); }
+
+    create() {
+        addKitchenBg(this, 0.35);
+        this.add.rectangle(WIDTH / 2, HEIGHT / 2, WIDTH, HEIGHT, 0x000000, 0.45);
+        this.add.text(WIDTH / 2, HEIGHT / 2 - 100, 'Running 粿', {
+            fontSize: '56px', fill: '#fff', fontStyle: 'bold'
+        }).setOrigin(0.5).setDepth(1);
+        this.add.image(WIDTH / 2, HEIGHT / 2 - 10, 'player_front').setDisplaySize(80, 80).setDepth(1);
+        const btn = this.add.text(WIDTH / 2, HEIGHT / 2 + 70, '点击开始游戏', {
+            fontSize: '28px', fill: '#ffd700'
+        }).setOrigin(0.5).setInteractive({ useHandCursor: true }).setDepth(1);
+        btn.on('pointerover', () => btn.setStyle({ fill: '#fff' }));
+        btn.on('pointerout', () => btn.setStyle({ fill: '#ffd700' }));
+        btn.on('pointerdown', () => this.scene.start('GameScene'));
+    }
+}
+
+class GameScene extends Phaser.Scene {
+    constructor() { super('GameScene'); }
+
+    create() {
+        addKitchenBg(this);
+
+        this.uiLayout = getUILayout();
+        this.virtualJoystick = null;
+
+        this.collectedFood = new Set();
+        this.foodUI = this.add.group();
+        this.foodPanelBg = null;
+        this.foodSprites = {};
+        this.canMove = false;
+        this.gameOver = false;
+        this.hasSpoon = false;
+        this.spoonAwaitingQuiz = false;
+        this.hasSoapBoost = false;
+        this.bottleFrozen = false;
+        this.freezeText = null;
+        this.soapHintText = null;
+        this.isMoving = false;
+        this.canInput = true;
+        this.quizActive = false;
+        this.quizPanel = null;
+        this.quizKeyHandler = null;
+        this.timeLeft = GAME_TIME_LIMIT;
+        this.gameTimerEvent = null;
+        this.timerPaused = true;
+
+        this.stairsUnlocked = false;
+        this.stairHintText = null;
+
+        const st = LEVEL.playerStart;
+        this.playerGx = st.gx;
+        this.playerGy = st.gy;
+        this.playerElev = st.elev;
+        this.facing = 'right';
+
+        const p0 = gridToPixel(st.gx, st.gy);
+        this.player = this.add.image(p0.x, p0.y, 'player_front')
+            .setDisplaySize(64, 64).setDepth(11).setOrigin(0.5, 0.9);
+
+        this.buildPhysicsColliders();
+
+        LEVEL.obstacles.forEach(obs => {
+            if (!obs.sprite) return;
+            const pos = gridToPixel(obs.gx, obs.gy);
+            this.add.image(pos.x, pos.y, obs.sprite)
+                .setDisplaySize(obs.w, obs.h).setDepth(7);
+        });
+
+        this.cabinetSprite = null;
+        this.spawnSpoonOnGround();
+        this.spawnFoodSprites();
+
+        const fp = gridToPixel(LEVEL.flag.gx, LEVEL.flag.gy);
+        this.add.image(fp.x, fp.y + 4, 'flag').setDisplaySize(36, 46).setDepth(9);
+
+        this.spoonBuffIcon = this.add.image(WIDTH - 36, 36, 'spoon')
+            .setDisplaySize(30, 30).setVisible(false).setDepth(20).setScrollFactor(0);
+
+        this.timerText = this.add.text(WIDTH / 2, 12, this.formatTime(this.timeLeft), {
+            fontSize: '22px', fill: '#ffffff', fontStyle: 'bold',
+            backgroundColor: '#000000aa', padding: { x: 10, y: 4 }
+        }).setOrigin(0.5, 0).setDepth(20).setScrollFactor(0);
+
+        this.updateFoodUI();
+        this.setupInput();
+        if (this.uiLayout.joystick) {
+            this.virtualJoystick = new VirtualJoystick(this, this.uiLayout);
+        }
+
+        this.countdownText = this.add.text(WIDTH / 2, HEIGHT / 2, '3', {
+            fontSize: '96px', fill: '#fff', fontStyle: 'bold'
+        }).setOrigin(0.5).setDepth(30);
+
+        this.count = 3;
+        this.time.addEvent({
+            delay: 1000, repeat: 2,
+            callback: () => {
+                this.count--;
+                if (this.count > 0) this.countdownText.setText(String(this.count));
+                else this.countdownText.destroy();
+            }
+        });
+        this.time.delayedCall(3000, () => {
+            this.canMove = true;
+            this.timerPaused = false;
+            this.startGameTimer();
+        });
+    }
+
+    formatTime(sec) {
+        const m = Math.floor(sec / 60);
+        const s = sec % 60;
+        return `${m}:${String(s).padStart(2, '0')}`;
+    }
+
+    startGameTimer() {
+        if (this.gameTimerEvent) this.gameTimerEvent.remove(false);
+        this.gameTimerEvent = this.time.addEvent({
+            delay: 1000,
+            loop: true,
+            callback: () => this.tickGameTimer()
+        });
+    }
+
+    tickGameTimer() {
+        if (this.gameOver || this.timerPaused || !this.canMove) return;
+        if (this.collectedFood.size >= FOOD_LIST.length) return;
+        this.timeLeft--;
+        this.updateTimerUI();
+        if (this.timeLeft <= 0) this.failGame('timeout');
+    }
+
+    updateTimerUI() {
+        if (!this.timerText) return;
+        this.timerText.setText(this.formatTime(Math.max(0, this.timeLeft)));
+        if (this.timeLeft <= 15) this.timerText.setFill('#ff6b6b');
+        else if (this.timeLeft <= 30) this.timerText.setFill('#ffd700');
+        else this.timerText.setFill('#ffffff');
+    }
+
+    spawnFoodSprites() {
+        LEVEL.foods.forEach(f => {
+            if (this.collectedFood.has(f.key)) return;
+            if (this.foodSprites[f.key]) return;
+            const pos = gridToPixel(f.gx, f.gy);
+            const sz = FOOD_MAP_SIZES[f.key] || 52;
+            this.foodSprites[f.key] = this.add.image(pos.x, pos.y, f.key)
+                .setDisplaySize(sz, sz).setDepth(6 + f.elev);
+        });
+    }
+
+    spawnSpoonOnGround() {
+        if (this.spoonSprite) {
+            this.spoonSprite.destroy();
+            this.spoonSprite = null;
+        }
+        const s = LEVEL.spoon;
+        const pos = gridToPixel(s.gx, s.gy);
+        this.spoonSprite = this.add.image(pos.x, pos.y, 'spoon')
+            .setDisplaySize(32, 32).setDepth(6 + s.elev);
+        this.spawnSpoonMarker();
+    }
+
+    /** 拾取地面锅铲（拾取后再弹出问答） */
+    trySpoonPickup() {
+        if (this.hasSpoon || this.quizActive || this.spoonAwaitingQuiz) return;
+        const s = LEVEL.spoon;
+        if (s.gx !== this.playerGx || s.gy !== this.playerGy || s.elev !== this.playerElev) return;
+        this.pickupSpoon();
+        this.showSpoonQuiz();
+    }
+
+    pickupSpoon() {
+        this.spoonAwaitingQuiz = true;
+        if (this.spoonSprite) {
+            this.spoonSprite.destroy();
+            this.spoonSprite = null;
+        }
+        if (this.spoonMarker) {
+            this.spoonMarker.destroy(true);
+            this.spoonMarker = null;
+        }
+        this.spoonBuffIcon.setVisible(true);
+        this.updateFoodUI();
+    }
+
+    /** 地图上标注锅铲位置（拾取前显示） */
+    spawnSpoonMarker() {
+        if (this.spoonMarker) {
+            this.spoonMarker.destroy(true);
+            this.spoonMarker = null;
+        }
+        if (this.hasSpoon || this.spoonAwaitingQuiz) return;
+        const pos = gridToPixel(LEVEL.spoon.gx, LEVEL.spoon.gy);
+        const marker = this.add.container(pos.x, pos.y - 54).setDepth(12);
+        const label = this.add.text(0, 0, '锅铲', {
+            fontSize: '14px', fill: '#ffd700', fontStyle: 'bold',
+            backgroundColor: '#000000cc', padding: { x: 6, y: 3 }
+        }).setOrigin(0.5);
+        const arrow = this.add.text(0, 20, '▼', {
+            fontSize: '14px', fill: '#ffd700'
+        }).setOrigin(0.5);
+        marker.add([label, arrow]);
+        this.tweens.add({
+            targets: marker,
+            y: pos.y - 58,
+            duration: 800,
+            yoyo: true,
+            repeat: -1,
+            ease: 'Sine.easeInOut'
+        });
+        this.spoonMarker = marker;
+    }
+
+    shutdown() {
+        if (this.virtualJoystick) {
+            this.virtualJoystick.destroy();
+            this.virtualJoystick = null;
+        }
+    }
+
+    setupInput() {
+        this.input.keyboard.on('keydown', (e) => {
+            if (!this.canMove || !this.canInput || this.isMoving || this.gameOver ||
+                this.bottleFrozen || this.quizActive) return;
+            let dir = null;
+            if (e.code === 'KeyW' || e.code === 'ArrowUp') dir = 'up';
+            if (e.code === 'KeyS' || e.code === 'ArrowDown') dir = 'down';
+            if (e.code === 'KeyA' || e.code === 'ArrowLeft') dir = 'left';
+            if (e.code === 'KeyD' || e.code === 'ArrowRight') dir = 'right';
+            if (dir) this.tryMove(dir);
+        });
+    }
+
+    tryMove(dir) {
+        this.facing = dir;
+        this.updatePlayerVisual();
+
+        const dest = resolveMove(this.playerGx, this.playerGy, this.playerElev, dir, this.collectedFood);
+        if (!dest) return;
+
+        this.executeMove(dest.gx, dest.gy, dest.elev);
+    }
+
+    executeMove(nx, ny, elev) {
+        const prevGx = this.playerGx;
+        const prevGy = this.playerGy;
+        const prevElev = this.playerElev;
+
+        if (prevElev !== elev && !isLadderTransition(prevGx, prevGy, prevElev, nx, ny, elev)) {
+            return;
+        }
+        if (!canEnterGround(prevGx, prevGy, prevElev, nx, ny, elev, this.collectedFood)) {
+            return;
+        }
+
+        this.canInput = false;
+        this.isMoving = true;
+        this.playerGx = nx;
+        this.playerGy = ny;
+        this.playerElev = elev;
+        this.player.setDepth(10 + elev);
+
+        const target = gridToPixel(nx, ny);
+        this.tweens.add({
+            targets: this.player,
+            x: target.x, y: target.y,
+            duration: this.getMoveDuration(), ease: 'Linear',
+            onComplete: () => {
+                this.isMoving = false;
+                if (prevElev !== this.playerElev) this.refreshPathOverlay();
+                this.handlePropEffects(prevGx, prevGy, prevElev);
+                this.afterMove();
+                if (!this.bottleFrozen) this.canInput = true;
+            }
+        });
+    }
+
+    getMoveDuration() {
+        return this.hasSoapBoost ? 72 : 130;
+    }
+
+    handlePropEffects(prevGx, prevGy, prevElev) {
+        if (prevGx === this.playerGx && prevGy === this.playerGy && prevElev === this.playerElev) return;
+        const prop = LEVEL.obstacles.find(o =>
+            o.gx === this.playerGx && o.gy === this.playerGy && o.elev === this.playerElev);
+        if (!prop) return;
+        if (prop.kind === 'soap' && !this.hasSoapBoost) {
+            this.hasSoapBoost = true;
+            this.showSoapBoostHint();
+        }
+        if (prop.kind === 'bottle') this.startBottleFreeze();
+    }
+
+    showSoapBoostHint() {
+        if (this.soapHintText) this.soapHintText.destroy();
+        this.soapHintText = this.add.text(WIDTH / 2, HEIGHT / 2, '肥皂！加速！', {
+            fontSize: '28px', fill: '#87ceeb', fontStyle: 'bold',
+            backgroundColor: '#000000cc', padding: { x: 12, y: 6 }
+        }).setOrigin(0.5).setDepth(40);
+        this.time.delayedCall(2000, () => {
+            if (this.soapHintText) {
+                this.soapHintText.destroy();
+                this.soapHintText = null;
+            }
+        });
+    }
+
+    startBottleFreeze() {
+        if (this.bottleFrozen) return;
+        this.bottleFrozen = true;
+        this.canInput = false;
+        this.timerPaused = true;
+        if (this.freezeText) this.freezeText.destroy();
+        this.freezeText = this.add.text(WIDTH / 2, HEIGHT / 2, '调料瓶！停3秒', {
+            fontSize: '28px', fill: '#ffd700', fontStyle: 'bold',
+            backgroundColor: '#000000cc', padding: { x: 12, y: 6 }
+        }).setOrigin(0.5).setDepth(40);
+        this.time.delayedCall(3000, () => {
+            this.bottleFrozen = false;
+            if (this.freezeText) {
+                this.freezeText.destroy();
+                this.freezeText = null;
+            }
+            if (!this.quizActive) this.timerPaused = false;
+            if (!this.isMoving && !this.gameOver) this.canInput = true;
+        });
+    }
+
+    refreshPathOverlay() {
+        if (!SHOW_PATH_OVERLAY) return;
+        if (this.pathOverlay) this.pathOverlay.destroy(true);
+        this.pathOverlay = drawWalkablePaths(this, this.playerElev, 2);
+    }
+
+    afterMove() {
+        if (isPoolCell(this.playerGx, this.playerGy, this.playerElev) && !this.hasSpoon) {
+            this.failGame('pool');
+            return;
+        }
+
+        this.trySpoonPickup();
+
+        LEVEL.foods.forEach(f => {
+            if (this.collectedFood.has(f.key)) return;
+            if (f.gx === this.playerGx && f.gy === this.playerGy && f.elev === this.playerElev) {
+                this.collectedFood.add(f.key);
+                if (this.foodSprites[f.key]) {
+                    this.foodSprites[f.key].destroy();
+                    delete this.foodSprites[f.key];
+                }
+                this.updateFoodUI();
+            }
+        });
+
+        if (!this.stairsUnlocked && hasUnlockedDeskStairs(this.collectedFood)) {
+            this.stairsUnlocked = true;
+            this.showStairUnlockedHint();
+        }
+
+        this.checkWin();
+    }
+
+    /** 集齐6样（除水）后提示中桌左侧楼梯已开放 */
+    showStairUnlockedHint() {
+        if (this.stairHintText) this.stairHintText.destroy();
+        this.stairHintText = this.add.text(WIDTH / 2, HEIGHT - 28,
+            '材料已齐！请从中桌左侧楼梯下到地面取水，再到水池下方拾取锅铲', {
+                fontSize: '15px', fill: '#ffd700', backgroundColor: '#000000aa',
+                padding: { x: 8, y: 4 }
+            }).setOrigin(0.5).setDepth(25);
+        this.time.delayedCall(3500, () => {
+            if (this.stairHintText) {
+                this.stairHintText.destroy();
+                this.stairHintText = null;
+            }
+        });
+    }
+
+    showSpoonQuiz() {
+        if (this.quizActive) return;
+        this.quizActive = true;
+        this.timerPaused = true;
+        this.canInput = false;
+
+        const panel = this.add.container(WIDTH / 2, HEIGHT / 2).setDepth(50);
+        const bg = this.add.rectangle(0, 0, 520, 240, 0x1a1a2e, 0.96)
+            .setStrokeStyle(3, 0xffd700);
+        const q = this.add.text(0, -70, SPOON_QUIZ_QUESTION, {
+            fontSize: '22px', fill: '#ffffff', align: 'center',
+            wordWrap: { width: 460 }
+        }).setOrigin(0.5);
+        const tip = this.add.text(0, -18, '已拾取锅铲！请作答（Y=是 / N=否）', {
+            fontSize: '16px', fill: '#cccccc'
+        }).setOrigin(0.5);
+
+        const makeBtn = (label, x, answer) => {
+            const t = this.add.text(x, 52, label, {
+                fontSize: '24px', fill: '#ffd700', backgroundColor: '#333333',
+                padding: { x: 24, y: 8 }
+            }).setOrigin(0.5).setInteractive({ useHandCursor: true });
+            t.on('pointerover', () => t.setStyle({ fill: '#ffffff' }));
+            t.on('pointerout', () => t.setStyle({ fill: '#ffd700' }));
+            t.on('pointerdown', () => this.answerSpoonQuiz(answer));
+            return t;
+        };
+
+        panel.add([bg, q, tip, makeBtn('是', -80, '是'), makeBtn('否', 80, '否')]);
+        this.quizPanel = panel;
+
+        this.quizKeyHandler = (e) => {
+            if (!this.quizActive) return;
+            if (e.code === 'KeyY') this.answerSpoonQuiz('是');
+            if (e.code === 'KeyN') this.answerSpoonQuiz('否');
+        };
+        this.input.keyboard.on('keydown', this.quizKeyHandler);
+    }
+
+    closeQuiz() {
+        this.quizActive = false;
+        this.timerPaused = false;
+        if (this.quizKeyHandler) {
+            this.input.keyboard.off('keydown', this.quizKeyHandler);
+            this.quizKeyHandler = null;
+        }
+        if (this.quizPanel) {
+            this.quizPanel.destroy(true);
+            this.quizPanel = null;
+        }
+        if (!this.isMoving && !this.gameOver && !this.bottleFrozen) this.canInput = true;
+    }
+
+    answerSpoonQuiz(answer) {
+        if (!this.quizActive) return;
+        if (answer === SPOON_QUIZ_ANSWER) {
+            this.closeQuiz();
+            this.hasSpoon = true;
+            this.spoonAwaitingQuiz = false;
+            this.updateFoodUI();
+            this.showBriefCenterText('回答正确！锅铲已生效', '#4ade80');
+        } else {
+            this.closeQuiz();
+            this.resetAfterWrongQuiz();
+        }
+    }
+
+    showBriefCenterText(msg, color = '#ffffff', duration = 2000) {
+        const t = this.add.text(WIDTH / 2, HEIGHT / 2, msg, {
+            fontSize: '26px', fill: color, fontStyle: 'bold',
+            backgroundColor: '#000000cc', padding: { x: 12, y: 6 }
+        }).setOrigin(0.5).setDepth(45);
+        this.time.delayedCall(duration, () => t.destroy());
+    }
+
+    /** 问答答错：全部食材与状态归位，计时重置 */
+    resetAfterWrongQuiz() {
+        this.collectedFood.clear();
+        Object.values(this.foodSprites).forEach(s => s && s.destroy());
+        this.foodSprites = {};
+        this.spawnFoodSprites();
+
+        this.hasSpoon = false;
+        this.spoonAwaitingQuiz = false;
+        this.spawnSpoonOnGround();
+        this.spoonBuffIcon.setVisible(false);
+        this.hasSoapBoost = false;
+        this.stairsUnlocked = false;
+
+        if (this.stairHintText) {
+            this.stairHintText.destroy();
+            this.stairHintText = null;
+        }
+        if (this.freezeText) {
+            this.freezeText.destroy();
+            this.freezeText = null;
+        }
+        if (this.soapHintText) {
+            this.soapHintText.destroy();
+            this.soapHintText = null;
+        }
+        this.bottleFrozen = false;
+
+        const st = LEVEL.playerStart;
+        this.playerGx = st.gx;
+        this.playerGy = st.gy;
+        this.playerElev = st.elev;
+        const p = gridToPixel(st.gx, st.gy);
+        this.player.setPosition(p.x, p.y).setDepth(10 + st.elev);
+        this.facing = 'right';
+        this.updatePlayerVisual();
+
+        this.timeLeft = GAME_TIME_LIMIT;
+        this.updateTimerUI();
+        this.updateFoodUI();
+        this.showBriefCenterText('回答错误！所有物品已归位，请重新开始', '#f87171', 2500);
+    }
+
+    failGame(reason) {
+        if (this.gameOver) return;
+        this.gameOver = true;
+        if (this.gameTimerEvent) {
+            this.gameTimerEvent.remove(false);
+            this.gameTimerEvent = null;
+        }
+        this.scene.start('LoseScene', { reason });
+    }
+
+    updatePlayerVisual() {
+        if (this.facing === 'up') {
+            this.player.setTexture('player_back').setFlipX(false);
+        } else {
+            this.player.setTexture('player_front');
+            this.player.setFlipX(this.facing === 'left');
+        }
+    }
+
+    checkWin() {
+        const f = LEVEL.flag;
+        if (!this.gameOver &&
+            f.gx === this.playerGx && f.gy === this.playerGy && f.elev === this.playerElev) {
+            this.gameOver = true;
+            if (this.gameTimerEvent) {
+                this.gameTimerEvent.remove(false);
+                this.gameTimerEvent = null;
+            }
+            this.scene.start('WinScene');
+        }
+    }
+
+    /** 桌沿/障碍隐形静态碰撞体（?debug 时 Phaser 显示轮廓） */
+    buildPhysicsColliders() {
+        this.staticWalls = this.physics.add.staticGroup();
+
+        [0, 1, 2].forEach(elev => {
+            const walkSet = LEVEL.walk[elev];
+            if (!walkSet) return;
+            walkSet.forEach(key => {
+                const [gx, gy] = key.split(',').map(Number);
+                [[0, -1], [0, 1], [-1, 0], [1, 0]].forEach(([dx, dy]) => {
+                    const nx = gx + dx;
+                    const ny = gy + dy;
+                    if (needsDesktopEdgeBlock(gx, gy, elev, nx, ny)) {
+                        this.addStaticWall(nx, ny);
+                    }
+                });
+            });
+        });
+
+        LEVEL.obstacles.forEach(obs => {
+            if (obs.kind === 'bottle' || obs.kind === 'soap') return;
+            this.addStaticWall(obs.gx, obs.gy);
+        });
+    }
+
+    addStaticWall(gx, gy) {
+        const pos = gridToPixel(gx, gy);
+        const wall = this.staticWalls.create(pos.x, pos.y, 'wall_hitbox');
+        wall.setVisible(false).refreshBody();
+        wall.body.setSize(TILE, TILE);
+    }
+
+    updateFoodUI() {
+        this.foodUI.clear(true, true);
+        const ui = this.uiLayout || getUILayout();
+        if (ui.touch && !this.foodPanelBg) {
+            this.foodPanelBg = this.add.rectangle(
+                ui.foodPanelW / 2 + 4, ui.foodStartY + (FOOD_LIST.length * ui.foodRowH) / 2,
+                ui.foodPanelW, (FOOD_LIST.length + 1) * ui.foodRowH + 8,
+                0x000000, 0.35
+            ).setOrigin(0.5, 0.5).setDepth(19).setScrollFactor(0);
+        }
+        if (!ui.touch && this.foodPanelBg) {
+            this.foodPanelBg.destroy();
+            this.foodPanelBg = null;
+        }
+
+        FOOD_LIST.forEach((key, idx) => {
+            const y = ui.foodStartY + idx * ui.foodRowH;
+            const got = this.collectedFood.has(key);
+            const icon = this.add.image(ui.foodIconX, y, key)
+                .setDisplaySize(ui.foodIconSize, ui.foodIconSize).setDepth(20).setScrollFactor(0);
+            if (!got) icon.setAlpha(0.35).setTint(0x888888);
+            this.foodUI.add(icon);
+            this.foodUI.add(this.add.text(ui.foodTextX, y, FOOD_CN[idx], {
+                fontSize: `${ui.foodFontSize}px`, fill: got ? '#ffffff' : '#777777'
+            }).setOrigin(0, 0.5).setDepth(20).setScrollFactor(0));
+        });
+
+        const spoonY = ui.foodStartY + FOOD_LIST.length * ui.foodRowH;
+        const gotSpoon = this.hasSpoon;
+        const spoonPending = this.spoonAwaitingQuiz;
+        const spoonIcon = this.add.image(ui.foodIconX, spoonY, 'spoon')
+            .setDisplaySize(ui.foodIconSize - 2, ui.foodIconSize - 2).setDepth(20).setScrollFactor(0);
+        if (!gotSpoon && !spoonPending) spoonIcon.setAlpha(0.35).setTint(0x888888);
+        this.foodUI.add(spoonIcon);
+        const spoonLabel = gotSpoon ? '锅铲'
+            : spoonPending ? '锅铲·待答'
+            : '锅铲·池下';
+        this.foodUI.add(this.add.text(ui.foodTextX, spoonY, spoonLabel, {
+            fontSize: `${ui.foodFontSize}px`,
+            fill: gotSpoon ? '#ffffff' : '#ffd700'
+        }).setOrigin(0, 0.5).setDepth(20).setScrollFactor(0));
+    }
+}
+
+class WinScene extends Phaser.Scene {
+    constructor() { super('WinScene'); }
+    create() {
+        addKitchenBg(this, 0.3);
+        this.add.rectangle(WIDTH / 2, HEIGHT / 2, WIDTH, HEIGHT, 0x000000, 0.5);
+        this.add.text(WIDTH / 2, HEIGHT / 2 - 60, '恭喜通关！触碰旗帜成功！', {
+            fontSize: '40px', fill: '#4ade80', fontStyle: 'bold'
+        }).setOrigin(0.5);
+        this.add.text(WIDTH / 2, HEIGHT / 2 + 30, '返回菜单', {
+            fontSize: '26px', fill: '#ffd700'
+        }).setOrigin(0.5).setInteractive({ useHandCursor: true })
+            .on('pointerdown', () => this.scene.start('MenuScene'));
+    }
+}
+
+class LoseScene extends Phaser.Scene {
+    constructor() { super('LoseScene'); }
+    create(data) {
+        const reason = data?.reason || 'pool';
+        const msg = reason === 'timeout'
+            ? '超时！未在1分30秒内集齐所有物品'
+            : '掉入水池，游戏失败';
+        addKitchenBg(this, 0.3);
+        this.add.rectangle(WIDTH / 2, HEIGHT / 2, WIDTH, HEIGHT, 0x000000, 0.5);
+        this.add.text(WIDTH / 2, HEIGHT / 2 - 60, msg, {
+            fontSize: '36px', fill: '#f87171', fontStyle: 'bold', align: 'center',
+            wordWrap: { width: WIDTH - 80 }
+        }).setOrigin(0.5);
+        this.add.text(WIDTH / 2, HEIGHT / 2 + 10, '重新挑战', {
+            fontSize: '26px', fill: '#ffd700'
+        }).setOrigin(0.5).setInteractive({ useHandCursor: true })
+            .on('pointerdown', () => this.scene.start('GameScene'));
+        this.add.text(WIDTH / 2, HEIGHT / 2 + 55, '返回菜单', {
+            fontSize: '26px', fill: '#cccccc'
+        }).setOrigin(0.5).setInteractive({ useHandCursor: true })
+            .on('pointerdown', () => this.scene.start('MenuScene'));
+    }
+}
+
+new Phaser.Game({
+    type: Phaser.AUTO,
+    width: WIDTH,
+    height: HEIGHT,
+    parent: 'phaser-game',
+    backgroundColor: '#000000',
+    scale: {
+        mode: Phaser.Scale.FIT,
+        autoCenter: Phaser.Scale.CENTER_BOTH,
+        width: WIDTH,
+        height: HEIGHT
+    },
+    input: {
+        activePointers: 2
+    },
+    physics: {
+        default: 'arcade',
+        arcade: { debug: PHASER_PHYSICS_DEBUG, gravity: { y: 0 } }
+    },
+    scene: [BootScene, MenuScene, GameScene, WinScene, LoseScene, CoordsScene]
+});
+</script>
+</body>
+</html>
